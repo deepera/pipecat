@@ -103,6 +103,9 @@ class MiniMaxTTSSettings(TTSSettings):
         text_normalization: Enable text normalization (Chinese/English).
         latex_read: Enable LaTeX formula reading.
         language_boost: Language boost string for multilingual support.
+        pronunciation_dict: Replacement pairs as "text/reading", sent to the API as
+            ``{"tone": [...]}``. Readings must be romaji for Japanese; the API accepts
+            kana and then mispronounces it.
     """
 
     speed: float | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
@@ -112,6 +115,9 @@ class MiniMaxTTSSettings(TTSSettings):
     text_normalization: bool | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
     latex_read: bool | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
     language_boost: str | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    pronunciation_dict: list[str] | None | NotGiven = field(
+        default_factory=lambda: NOT_GIVEN
+    )
 
     @classmethod
     def from_mapping(cls, settings: Mapping[str, Any]) -> Self:
@@ -239,6 +245,7 @@ class MiniMaxHttpTTSService(TTSService):
             volume=1.0,
             pitch=0,
             language_boost=None,
+            pronunciation_dict=None,
             emotion=None,
             text_normalization=None,
             latex_read=None,
@@ -305,7 +312,10 @@ class MiniMaxHttpTTSService(TTSService):
         self._api_key = api_key
         self._group_id = group_id
         self._stream = stream
-        self._base_url = f"{base_url}?GroupId={group_id}"
+        # MiniMax's international endpoint binds the group to the API key and rejects a
+        # GroupId parameter with "1004 token not match group"; only the mainland endpoint
+        # expects one.
+        self._base_url = f"{base_url}?GroupId={group_id}" if group_id else base_url
         self._session = aiohttp_session
 
         # Init-only audio format config
@@ -342,6 +352,25 @@ class MiniMaxHttpTTSService(TTSService):
         await super().start(frame)
         self._audio_sample_rate = self.sample_rate
         logger.debug(f"MiniMax TTS initialized with sample_rate: {self.sample_rate}")
+
+    @staticmethod
+    def _describe_empty_response(head: bytes) -> str:
+        """Explain a synthesis that returned no audio.
+
+        MiniMax rejects a request with HTTP 200 and a plain JSON body carrying
+        ``base_resp``, which the streaming parser skips over, so the reason has to be
+        recovered from the start of the response.
+        """
+        try:
+            base_resp = json.loads(head.decode("utf-8")).get("base_resp", {})
+        except (UnicodeDecodeError, ValueError, AttributeError):
+            base_resp = {}
+        if base_resp.get("status_code"):
+            return (
+                f"MiniMax TTS error {base_resp['status_code']}: "
+                f"{base_resp.get('status_msg', 'unknown error')}"
+            )
+        return f"MiniMax TTS returned no audio: {head[:200]!r}"
 
     @traced_tts
     async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame, None]:
@@ -392,17 +421,29 @@ class MiniMaxHttpTTSService(TTSService):
         }
         if self._settings.language_boost is not None:
             payload["language_boost"] = self._settings.language_boost
+        # A dictionary is only meaningful as a non-empty list; the isinstance test rejects
+        # the NOT_GIVEN sentinel and an empty configuration together.
+        if isinstance(self._settings.pronunciation_dict, list) and self._settings.pronunciation_dict:
+            payload["pronunciation_dict"] = {"tone": self._settings.pronunciation_dict}
 
         try:
             async with self._session.post(
                 self._base_url, headers=headers, json=payload
             ) as response:
                 if response.status != 200:
-                    error_message = f"MiniMax TTS error: HTTP {response.status}"
+                    body = (await response.text())[:500]
+                    error_message = f"MiniMax TTS error: HTTP {response.status}: {body}"
                     yield ErrorFrame(error=error_message)
                     return
 
                 await self.start_tts_usage_metrics(text)
+
+                # A rejected request answers HTTP 200 with the verdict in `base_resp` and no
+                # "data:" blocks at all, so the parsing loop below would simply find nothing
+                # and end. Track whether any audio was produced, and keep the head of the
+                # response, so that case is reported instead of returning silence.
+                produced_audio = False
+                head = bytearray()
 
                 # Process the streaming response
                 buffer = bytearray()
@@ -412,6 +453,9 @@ class MiniMaxHttpTTSService(TTSService):
                 async for chunk in response.content.iter_chunked(CHUNK_SIZE):
                     if not chunk:
                         continue
+
+                    if not produced_audio and len(head) < 2048:
+                        head.extend(chunk[: 2048 - len(head)])
 
                     buffer.extend(chunk)
 
@@ -456,6 +500,7 @@ class MiniMaxHttpTTSService(TTSService):
                                     # Convert this chunk of data
                                     audio_chunk = bytes.fromhex(hex_chunk)
                                     if audio_chunk:
+                                        produced_audio = True
                                         await self.stop_ttfb_metrics()
                                         yield TTSAudioRawFrame(
                                             audio=audio_chunk,
@@ -474,6 +519,9 @@ class MiniMaxHttpTTSService(TTSService):
                                 f"Error decoding JSON: {e}, data: {data_block[:100]}",
                             )
                             continue
+
+                if not produced_audio:
+                    yield ErrorFrame(error=self._describe_empty_response(bytes(head)))
 
         except Exception as e:
             yield ErrorFrame(error=f"Unknown error occurred: {e}", exception=e)
